@@ -26,6 +26,7 @@ extern std::shared_ptr<SDRDevice> radio;
 float scale_max = 100.0f;
 std::shared_ptr<dsp::stream<std::complex<float>>> moduleStream;
 extern std::shared_ptr<LivePipeline> live_pipeline;
+std::vector<std::shared_ptr<ProcessingModule>> modules;
 
 bool process_fft = false;
 std::mutex fft_run;
@@ -132,6 +133,9 @@ void startRealLive()
     // Start pipeline
     live_pipeline->start(moduleStream, processThreadPool);
 
+    // Get pipeline module order
+    modules = live_pipeline->getModules();
+
     firstUIRun = true;
     showUI = true;
 }
@@ -229,12 +233,39 @@ void renderLive()
             }
         }
 
+        // Draw module windows
+        live_pipeline->drawUIs();
+
+        // Draw connectors between module windows
+        for(size_t i = 0; i < modules.size() - 1; i++)
+        {
+            ImGuiWindow *w0 = ImGui::FindWindowByName(modules[i]->getWindowTitle().c_str());
+            ImGuiWindow *w1 = ImGui::FindWindowByName(modules[i+1]->getWindowTitle().c_str());
+
+            float x0 = w0->Pos.x + w0->Size.x;
+            float y0 = w0->Pos.y + (w0->Size.y / 2);
+            float x1 = w1->Pos.x;
+            float y1 = w1->Pos.y + (w1->Size.y / 2);
+
+            ImGui::GetBackgroundDrawList()->AddTriangleFilled(
+                {x1 - 10, y1 - 10},
+                {x1 + 1, y1},
+                {x1 - 10, y1 + 10},
+                IM_COL32(100, 100, 100, 255)
+            );
+
+            ImGui::GetBackgroundDrawList()->AddBezierCubic(
+                {x0, y0}, {x0 + 100, y0},
+                {x1 - 100, y1}, {x1 - 10, y1},
+                IM_COL32(100, 100, 100, 255),
+                3.0f
+            );
+        }
+
+        // Draw radio control window
         radio->drawUI();
 
-        //ImGui::SetNextWindowPos({0, 0});
-        live_pipeline->drawUIs();
-        //ImGui::Text("LIVE");
-
+        // Draw FFT window
         ImGui::Begin("Input FFT", NULL);
 
         fftPlotWidget.scale_max = scale_max;
