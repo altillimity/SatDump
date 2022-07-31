@@ -22,6 +22,7 @@ namespace goes
             image::Image<uint16_t> image5;
             int sat_number;
             int vis_width;
+            time_t imageTime;
         };
 
         namespace events
@@ -77,6 +78,7 @@ namespace goes
             // Stats
             std::vector<int> scid_stats;
             std::vector<int> vis_width_stats, ir_width_stats;
+            std::vector<time_t> image_Time;
 
             // UI Stuff
             unsigned int textureID = 0;

@@ -12,6 +12,7 @@
 #include "common/image/hue_saturation.h"
 #include "common/image/brightness_contrast.h"
 #include "common/thread_priority.h"
+#include "crc_table.h"
 
 #define FRAME_SIZE 32786
 
@@ -22,6 +23,22 @@ namespace goes
 {
     namespace gvar
     {
+
+         // CRC Implementation from LRIT-Missin-Specific-Document.pdf
+        uint16_t computeCRC(const uint8_t *data, int size)
+        {
+            uint16_t crc = 0xffff;
+            for (int i = 0; i < size; i++)
+                crc = (crc << 8) ^ crc_table[(crc >> 8) ^ (uint16_t)data[i]];
+            return crc;
+        }       
+        uint8_t computeXOR(const uint8_t *data, int size)
+        {
+            uint8_t crc = 0;
+            for (int i = 0; i < size; i++)
+                crc = crc ^ data[i];
+            return crc;
+        }       
         std::string GVARImageDecoderModule::getGvarFilename(int sat_number, std::tm *timeReadable, std::string channel)
         {
             std::string utc_filename = "G" + std::to_string(sat_number) + "_" + channel + "_" +                                                                     // Satellite name and channel
@@ -36,7 +53,7 @@ namespace goes
 
         void GVARImageDecoderModule::writeImages(GVARImages &images, std::string directory)
         {
-            const time_t timevalue = time(0);
+            const time_t timevalue = images.imageTime;
             std::tm *timeReadable = gmtime(&timevalue);
             std::string timestamp = std::to_string(timeReadable->tm_year + 1900) + "-" +
                                     (timeReadable->tm_mon + 1 > 9 ? std::to_string(timeReadable->tm_mon + 1) : "0" + std::to_string(timeReadable->tm_mon + 1)) + "-" +
@@ -53,7 +70,7 @@ namespace goes
 
             std::filesystem::create_directories(directory + "/" + dir_name);
 
-            std::string disk_folder = directory + "/" + dir_name;
+            std::string disk_folder = directory + "/" + dir_name; 
 
             logger->info("Resizing...");
             images.image1.resize(images.image1.width(), images.image1.height() * 1.75);
@@ -261,6 +278,9 @@ namespace goes
             logger->info("Decoding to " + directory);
 
             time_t lastTime = 0;
+            time_t imageTime=0;
+            time_t imageTimeBackup=time(0);
+            bool crc_valid=false;
 
             while (input_data_type == DATA_FILE ? !data_in.eof() : input_active.load())
             {
@@ -271,8 +291,34 @@ namespace goes
                     input_fifo->read((uint8_t *)frame, FRAME_SIZE);
 
                 // Parse main header
+                std::vector<uint16_t> block_ids;
                 PrimaryBlockHeader block_header = *((PrimaryBlockHeader *)&frame[8]);
-
+                crc_valid=true;
+                block_header.header_crc=~block_header.header_crc;
+                if(computeCRC((uint8_t*)&block_header,30)!=0)
+                {//CRC failed for first header, try second header
+                    //block_ids.clear();
+                    block_ids.push_back(block_header.block_id);
+                    block_header = *((PrimaryBlockHeader *)&frame[8+30]);
+                    block_header.header_crc=~block_header.header_crc;
+                    if(computeCRC((uint8_t*)&block_header,30)!=0)
+                    {//CRC failed for second header, try third header
+                        block_ids.push_back(block_header.block_id);
+                        block_header = *((PrimaryBlockHeader *)&frame[8+60]);
+                        block_header.header_crc=~block_header.header_crc;
+                        if(computeCRC((uint8_t*)&block_header,30)!=0)
+                        {//All headers failed CRC. Use best of 3.
+                            block_ids.push_back(block_header.block_id);
+                            block_header.block_id=most_common(block_ids.begin(),block_ids.end());
+                            crc_valid=false;
+                        }
+                    }
+                }
+                if(crc_valid && imageTime==0)
+                {//If this header passed CRC, and there is no image date set, then use the time from the header. This is a fallback in case no Block0's are found.
+                    tm time=block_header.time_code_bcd;
+                    imageTime=mktime(&time)+time.tm_gmtoff;
+                }
                 // Is this imagery? Blocks 1 to 10 are imagery
                 if (block_header.block_id >= 1 && block_header.block_id <= 10)
                 {
@@ -309,6 +355,15 @@ namespace goes
 
                                 if (isImageInProgress)
                                 {
+                                    if(image_Time.size()!=0)
+                                    {//Collected some block0 time headers. Get most common
+                                        imageTime=most_common(image_Time.begin(),image_Time.end());
+                                    }
+                                    else if(imageTime==0)
+                                    {//No block0 headers, and no image block headers passed CRC, use fallback
+                                        imageTime=imageTimeBackup;
+                                    }
+                                    imageTimeBackup=time(0); //Store new fallback time. Image start was detected NOW, so save NOW to use when saving this image.
                                     if (writeImagesAync)
                                     {
                                         logger->debug("Saving Async...");
@@ -321,7 +376,8 @@ namespace goes
                                                                 infraredImageReader2.getImage2(),
                                                                 visibleImageReader.getImage(),
                                                                 most_common(scid_stats.begin(), scid_stats.end()),
-                                                                most_common(vis_width_stats.begin(), vis_width_stats.end())});
+                                                                most_common(vis_width_stats.begin(), vis_width_stats.end()),
+                                                                imageTime});
                                         imageVectorMutex.unlock();
                                         isSavingInProgress = false;
                                     }
@@ -336,7 +392,8 @@ namespace goes
                                                              infraredImageReader2.getImage2(),
                                                              visibleImageReader.getImage(),
                                                              most_common(scid_stats.begin(), scid_stats.end()),
-                                                             most_common(vis_width_stats.begin(), vis_width_stats.end())};
+                                                             most_common(vis_width_stats.begin(), vis_width_stats.end()),
+                                                             imageTime};
                                         writeImages(images, directory);
                                         isSavingInProgress = false;
                                     }
@@ -349,6 +406,14 @@ namespace goes
                                     infraredImageReader1.startNewFullDisk();
                                     infraredImageReader2.startNewFullDisk();
                                     visibleImageReader.startNewFullDisk();
+
+                                    // Reset image time
+                                    imageTime=0;
+                                    image_Time.clear();
+                                }
+                                else
+                                {
+                                    imageTimeBackup=time(0); //Store new fallback time. Image start was detected NOW, so save NOW to use when saving this image.
                                 }
 
                                 endCount = 0;
@@ -387,8 +452,25 @@ namespace goes
                         else if (block_header.block_id == 2)
                             infraredImageReader2.pushFrame(&frame[8 + 30 * 3], line_header.relative_scan_count, current_words);
                     }
+                } 
+                //Is this Block 0 Satellite info?
+                else if (block_header.block_id==240)
+                {//Block 0
+                    Block0Header block_header0 = *((Block0Header *)&frame[8 + 30 * 3]);
+                    if(computeXOR((uint8_t*)&block_header0,278)==0xff)
+                    {//Basic XOR passed. Will only detect single bit errors. Not foolproof.
+                        tm block0_current_time = block_header0.TCURR;
+                        tm block0_image_time = block_header0.CIFST;
+                        time_t current_time = mktime(&block0_current_time);
+                        time_t image_time = mktime(&block0_image_time);
+                        float time_diff=difftime(current_time,image_time);
+                        if(time_diff<3600 and time_diff>-60) //Sanity Check. 
+                        {//Image start time and current header time is within one hour, set image time.
+                            image_Time.push_back(mktime(&block0_image_time)+block0_image_time.tm_gmtoff); 
+                        }
+                    }
                 }
-
+                
                 if (input_data_type == DATA_FILE)
                     progress = data_in.tellg();
 
@@ -413,12 +495,19 @@ namespace goes
                 if (imageSavingThread.joinable())
                     imageSavingThread.join();
             }
-
             logger->info("Dump remaining data...");
             if (isImageInProgress)
             {
                 isImageInProgress = false;
                 isSavingInProgress = true;
+                if(image_Time.size()!=0)
+                {//Collected some block0 time headers. Get most common
+                    imageTime=most_common(image_Time.begin(),image_Time.end());
+                }
+                else if(imageTime==0)
+                {//No block0 headers, and no image block headers passed CRC, use fallback
+                    imageTime=imageTimeBackup;
+                }
                 // Backup images
                 GVARImages images = {infraredImageReader1.getImage1(),
                                      infraredImageReader1.getImage2(),
@@ -426,7 +515,8 @@ namespace goes
                                      infraredImageReader2.getImage2(),
                                      visibleImageReader.getImage(),
                                      most_common(scid_stats.begin(), scid_stats.end()),
-                                     most_common(vis_width_stats.begin(), vis_width_stats.end())};
+                                     most_common(vis_width_stats.begin(), vis_width_stats.end()),
+                                     imageTime};
                 // Write those
                 writeImages(images, directory);
             }
